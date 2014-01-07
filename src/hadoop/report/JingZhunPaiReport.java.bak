@@ -1,0 +1,313 @@
+package hadoop.report;
+
+import file.pojo.MyVideoPlay;
+import hadoop.report.pojo.AdPosFrequencyGather;
+import hadoop.report.pojo.AdPosZoneSegmentGather;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import net.sf.json.JSONObject;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.input.TextInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat;
+import org.apache.hadoop.util.Tool;
+import org.apache.hadoop.util.ToolRunner;
+
+public class JingZhunPaiReport extends Configured implements Tool {
+	private static final Log log = LogFactory.getLog(JingZhunPaiReport.class);
+
+	/**
+	 * @param args
+	 */
+	public static void main(String[] args) {
+		try {
+			log.info("v0.1");
+			log.info("JingZhunPaiReport start");
+			int res = ToolRunner.run(new Configuration(), new JingZhunPaiReport(), args);
+			System.exit(res);
+		} catch (Exception e) {
+			log.error("Run Exception", e);
+		}
+	}
+
+	@Override
+	public int run(String[] arg0) throws Exception {
+		Job job = new Job(getConf());
+		job.setJarByClass(JingZhunPaiReport.class);
+		job.setJobName("Save_In_Reduce");
+		
+		
+		job.setOutputKeyClass(Text.class);
+		job.setOutputValueClass(Text.class);
+		
+		job.setMapOutputKeyClass(Text.class);
+		job.setMapOutputValueClass(Text.class);
+
+		job.setMapperClass(ReportMap.class);
+		job.setReducerClass(ReportReduce.class);
+		job.setNumReduceTasks(18);
+		
+		job.setInputFormatClass(TextInputFormat.class);
+		job.setOutputFormatClass(TextOutputFormat.class);
+		
+		FileInputFormat.setInputPaths(job, new Path("/penglin/reportSource"));
+		FileOutputFormat.setOutputPath(job, new Path("hdfs://RS143:9000/penglin/report"));
+
+		boolean success = job.waitForCompletion(true);
+		return success ? 0 : 1;
+	}
+
+	public static class ReportMap extends Mapper<LongWritable, Text, Text, Text> {
+
+		@Override
+		protected void cleanup(Context context) throws IOException, InterruptedException {
+			// TODO Auto-generated method stub
+			super.cleanup(context);
+		}
+
+		@Override
+		protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+			if (value == null || value.toString().isEmpty())
+				return;
+
+			String jsonString = value.toString();
+			JSONObject jsonObject = JSONObject.fromObject(jsonString);
+			String userId = jsonObject.getString("userId");
+			context.write(new Text(userId), value);
+		}
+
+		@Override
+		protected void setup(Context context) throws IOException, InterruptedException {
+			// TODO Auto-generated method stub
+			super.setup(context);
+		}
+	}
+
+	public static class ReportReduce extends Reducer<Text, Text, Text, Text> {
+		private static Map<String, AdPosZoneSegmentGather> adPosZoneSegmentMap = null;
+		private static Map<String, AdPosFrequencyGather> adPosZoneFrequencyMap = null;
+		private final static String[] adPosZoneSegmentKeys = new String[]{"orderId","advertiserVideoId","workstationId","adPosId","zoneProvince","zoneName","videoDemandDay","videoDemandHour"};
+		private final static String[] adPosZoneFrequencyKeys = new String[]{"orderId","advertiserVideoId","workstationId","adPosId","zoneProvince","zoneName","videoDemandDay"};
+//		private final static String[] adPosZoneFrequencyKeys = new String[]{"orderId","workstationId","videoDemandDay"};
+		
+		private MyVideoPlay play = null;
+		private JSONObject jsonObject = null;
+		@Override
+		protected void cleanup(Context context) throws IOException, InterruptedException {
+			// TODO Auto-generated method stub
+			super.cleanup(context);
+			log.info("gatherMap:"+adPosZoneSegmentMap.size());
+			log.info("gatherMap:"+adPosZoneFrequencyMap.size());
+			reportCacheClean(context);
+		}
+		
+		private void reportCacheClean(Context context) throws IOException, InterruptedException{
+			reduceOutput(adPosZoneSegmentMap, "AdPosZoneSegment", context);
+			adPosZoneSegmentMap.clear();
+			adPosZoneSegmentMap = null;
+			
+			reduceOutput(adPosZoneFrequencyMap, "AdPosZoneFrequency", context);
+			adPosZoneFrequencyMap.clear();
+			adPosZoneFrequencyMap = null;
+		}
+		
+		@Override
+		protected void setup(Context context) throws IOException, InterruptedException {
+			// TODO Auto-generated method stub
+			super.setup(context);
+			adPosZoneSegmentMap = new HashMap<String, AdPosZoneSegmentGather>();
+			adPosZoneFrequencyMap = new HashMap<String, AdPosFrequencyGather>();
+		}
+
+		@Override
+		protected void reduce(Text key, Iterable<Text> values, Context context) throws IOException, InterruptedException {
+			try {
+				List<Text> tmpValues = new ArrayList<Text>();
+				for(Text value : values){
+					tmpValues.add(value);
+				}
+				
+				adPosZoneSegmentReport(key, tmpValues.iterator(), context);
+				
+				adPosZoneFrequencyReport(key, tmpValues.iterator(), context);
+			} catch (Exception e) {
+				log.error("执行Reduce时出现异常", e);
+				throw new InterruptedException(e.getMessage());
+			}
+		}
+		
+		/**
+		 * 
+		 * @param map
+		 * @param outPutKey
+		 * @param context
+		 * @throws IOException
+		 * @throws InterruptedException
+		 */
+		private static long currTime = System.currentTimeMillis(); 
+		private void reduceOutput(Map map, String outPutKey, Context context) throws IOException, InterruptedException {
+			Set entrySet = map.keySet();
+			Iterator it = entrySet.iterator();
+			while (it.hasNext()) {
+				Object key = it.next();
+				context.write(new Text(outPutKey), new Text(map.get(key).toString()));
+				if(System.currentTimeMillis() - currTime >5*1000){
+					log.info("msg:"+map.get(key).toString());
+					currTime = System.currentTimeMillis();
+				}
+			
+			}
+			map.clear();
+		}
+		
+		private void adPosZoneSegmentReport(Text key, Iterator<Text> values, Context context) throws Exception {
+			boolean flag = false;
+			while(values.hasNext()) {
+				Text value = values.next();
+				if (value == null || value.toString().isEmpty())
+					continue;
+//				play = (MyVideoPlay) JsonConvertedUtil.jsonStringToObject(value.toString(), MyVideoPlay.class);
+				jsonObject = JSONObject.fromObject(value.toString());
+				String mapKey = getVideoPlayMapKeyUseJSON(jsonObject, adPosZoneSegmentKeys);
+				AdPosZoneSegmentGather gather = adPosZoneSegmentMap.get(mapKey);
+				if (gather == null) {
+					gather = new AdPosZoneSegmentGather();
+					setReportGatherUseJSON(gather, jsonObject);
+					adPosZoneSegmentMap.put(mapKey, gather);
+				} else {
+					gather.setDemandCount(gather.getDemandCount() + 1L);
+					if (!flag) {
+						gather.setDemandUniqueCount(gather.getDemandUniqueCount() + 1L);
+						flag = true;
+					}
+				}
+			}
+			if(adPosZoneSegmentMap.size()>2000){
+				reduceOutput(adPosZoneSegmentMap, "AdPosZoneSegment", context);
+			}
+		}
+		
+		private	Map<String,Long> frequencyCount = new HashMap<String, Long>();
+		private void adPosZoneFrequencyReport(Text key, Iterator<Text> values, Context context) throws Exception{
+			while(values.hasNext()) {
+				Text value = values.next();
+				if (value == null || value.toString().isEmpty())
+					continue;
+
+				jsonObject = JSONObject.fromObject(value.toString());
+				String mapKey = getVideoPlayMapKeyUseJSON(jsonObject, adPosZoneFrequencyKeys);
+				Long count = frequencyCount.get(mapKey);
+				if(count==null){
+					frequencyCount.put(mapKey, 1L);
+				}else{
+					frequencyCount.put(mapKey, count + 1L);
+				}
+			}
+			
+			Set<String> mapKeys = frequencyCount.keySet();
+			for(String mapKey : mapKeys){
+				Long count = frequencyCount.get(mapKey);
+				log.info("count:"+count);
+				AdPosFrequencyGather gather = adPosZoneFrequencyMap.get(mapKey);
+				if(gather==null){
+					int i = 0;
+					String[] keys = mapKey.split("\\$");
+					gather = new AdPosFrequencyGather();
+					gather.setCampaignId(keys[i++]);
+					gather.setCampaignTrackId(keys[i++]);
+					gather.setWorkstationId(keys[i++]);
+					gather.setAdPosId(keys[i++]);
+					gather.setZoneProvince(keys[i++]);
+					gather.setZoneCity(keys[i++]);
+					gather.setGatherDate(keys[i++]);
+				}
+				
+				gather.setFrequency(count.intValue());
+				adPosZoneFrequencyMap.put(mapKey, gather);
+			}
+			frequencyCount.clear();
+			
+			if(adPosZoneFrequencyMap.size()>1000){
+				reduceOutput(adPosZoneFrequencyMap, "AdPosZoneFrequency", context);
+			}
+		}
+		
+		private void setReportGatherUseJSON(AdPosZoneSegmentGather gather, JSONObject jsonObject) throws Exception{
+			gather.setCampaignId(jsonObject.getString("orderId"));
+			gather.setCampaignTrackId(jsonObject.getString("advertiserVideoId"));
+			gather.setWorkstationId(jsonObject.getString("workstationId"));
+			gather.setAdPosId(jsonObject.getString("adPosId"));
+			gather.setZoneProvince(jsonObject.getString("zoneProvince"));
+			gather.setZoneCity(jsonObject.getString("zoneName"));
+			gather.setGatherDate(jsonObject.getString("videoDemandDay"));
+			gather.setGatherHour(jsonObject.getString("videoDemandHour"));
+
+			gather.setDemandCount(1L);
+			gather.setDemandUniqueCount(1L);
+		}
+		
+		private String getVideoPlayMapKeyUseJSON(JSONObject jsonObject, String[] keys) {
+			StringBuffer sb = new StringBuffer();
+			for(String key : keys){
+				sb.append(jsonObject.getString(key));
+				sb.append("$");
+			}
+			return sb.toString();
+		}
+
+		/*
+		 private String getVideoPlayMapKey(MyVideoPlay play) {
+			StringBuffer sb = new StringBuffer();
+			sb.append(play.getOrderId());
+			sb.append("$");
+			sb.append(play.getAdvertiserVideoId());
+			sb.append("$");
+			sb.append(play.getWorkstationId());
+			sb.append("$");
+			sb.append(play.getAdPosId());
+			sb.append("$");
+			sb.append(play.getZoneProvince());
+			sb.append("$");
+			sb.append(play.getZoneName());
+			sb.append("$");
+			sb.append(play.getVideoDemandDay());
+			sb.append("$");
+			sb.append(play.getVideoDemandHour());
+			sb.append("$");
+			return sb.toString();
+		}
+		
+		private void setReportGather(AdPosZoneSegmentGather gather, MyVideoPlay play) throws Exception{
+			gather.setCampaignId(play.getOrderId());
+			gather.setCampaignTrackId(play.getAdvertiserVideoId());
+			gather.setWorkstationId(play.getWorkstationId());
+			gather.setAdPosId(play.getAdPosId());
+			gather.setZoneProvince(play.getZoneProvince());
+			gather.setZoneCity(play.getZoneName());
+			gather.setGatherDate(play.getVideoDemandDay());
+			gather.setGatherHour(play.getVideoDemandHour() + "");
+
+			gather.setDemandCount(1L);
+			gather.setDemandUniqueCount(1L);
+		}
+		*/
+	}
+}
